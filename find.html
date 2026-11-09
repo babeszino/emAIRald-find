@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>emAIRald – Drón keresése</title>
+<!--
+  Phone page of the "Drón keresése" panel (index.html). Self-contained on purpose: one file, no config.js, no transport -
+  it is hosted on its own HTTPS address (GitHub Pages), because GPS and compass are blocked on plain http.
+  The drone's last position is pasted in by hand: click the position on the dashboard (it copies "lat, lon"), paste it here.
+  After loading, the page needs no internet connection.
+-->
+<style>
+    :root { --bg: #0b0f14; --panel: #121820; --border: #232c38; --text: #e6edf3; --muted: #8b98a5;
+            --green: #3fb950; --amber: #d29922; --red: #f85149; --blue: #58a6ff; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+        background: var(--bg); color: var(--text); text-align: center;
+        font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+        display: flex; flex-direction: column; align-items: center;
+    }
+    h1 { font-size: 1.05rem; margin: 0; }
+    .status { color: var(--muted); font-size: 0.85rem; min-height: 1.3em; margin-top: 4px; }
+    .status.bad { color: var(--red); }
+    form { width: 100%; max-width: 360px; margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+    label { color: var(--muted); font-size: 0.85rem; }
+    input {
+        width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+        padding: 0.8rem; font: 1rem "SF Mono", Consolas, Menlo, monospace; text-align: center;
+    }
+    input:focus { outline: 2px solid var(--blue); outline-offset: 1px; }
+    #dial { width: min(72vw, 300px); aspect-ratio: 1; margin: 18px 0 4px; }
+    #dial svg { width: 100%; height: 100%; }
+    #arrow { transform-origin: 50% 50%; fill: var(--blue); }
+    #arrow.ahead { fill: var(--green); }
+    #dist { font-size: 3.2rem; font-weight: 700; line-height: 1.1; }
+    #hint { color: var(--amber); font-size: 0.95rem; min-height: 1.4em; margin: 4px 0 10px; }
+    .info { color: var(--muted); font-size: 0.82rem; line-height: 1.7; }
+    .info b { color: var(--text); font-weight: 600; }
+    .mono { font-family: "SF Mono", Consolas, Menlo, monospace; }
+    button, .btn {
+        display: inline-block; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; padding: 0.8rem 1.2rem; font-size: 1rem; text-decoration: none; cursor: pointer;
+    }
+    #start { background: var(--green); border-color: var(--green); color: #04130a; font-weight: 700; font-size: 1.15rem; padding: 1rem; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .actions { margin-top: 18px; }
+    [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>Drón keresése</h1>
+<div id="status" class="status"></div>
+
+<form id="form" autocomplete="off">
+    <label for="coords">Illeszd be a dashboardról másolt pozíciót:</label>
+    <input id="coords" type="text" inputmode="text" placeholder="47.228300, 16.609700" spellcheck="false" autocapitalize="off" autocorrect="off">
+    <button id="start" type="submit">Indítás</button>
+</form>
+
+<div id="dial" hidden>
+    <svg viewBox="-100 -100 200 200" aria-hidden="true">
+        <circle r="92" fill="none" stroke="#232c38" stroke-width="3"/>
+        <path id="arrow" d="M0 -80 L46 52 L0 30 L-46 52 Z"/>
+    </svg>
+</div>
+<div id="dist" hidden></div>
+<div id="hint"></div>
+<div class="info" id="info" hidden></div>
+<div class="actions" id="actions" hidden>
+    <a id="maps" class="btn" target="_blank" rel="noopener">Megnyitás térképen</a>
+</div>
+
+<script>
+(function () {
+    'use strict';
+
+    const HERE_M = 8;                // closer than this (or than the phone's GPS error) the arrow is only a hint
+    const STORE_KEY = 'emairald_find_target';
+    const $ = (id) => document.getElementById(id);
+    const rad = Math.PI / 180;
+
+    let target = null, pos = null, compass = null, moving = null, rot = null, queued = false, started = false;
+
+    function setStatus(text, bad) { $('status').textContent = text; $('status').classList.toggle('bad', !!bad); }
+
+    // the first two numbers of the pasted text: "47.228300, 16.609700" (also what Google Maps shows for a point)
+    function parseTarget(text) {
+        const n = (text.match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
+        return n.length >= 2 && Math.abs(n[0]) <= 90 && Math.abs(n[1]) <= 180 ? { lat: n[0], lon: n[1] } : null;
+    }
+
+    // great-circle distance and initial bearing from a to b
+    function toTarget(a, b) {
+        const dLat = (b.lat - a.lat) * rad, dLon = (b.lon - a.lon) * rad;
+        const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+        const y = Math.sin(dLon) * Math.cos(b.lat * rad);
+        const x = Math.cos(a.lat * rad) * Math.sin(b.lat * rad) - Math.sin(a.lat * rad) * Math.cos(b.lat * rad) * Math.cos(dLon);
+        return { dist: 12742000 * Math.asin(Math.sqrt(h)), bearing: (Math.atan2(y, x) / rad + 360) % 360 };
+    }
+
+    const fmtDist = (m) => m >= 1000 ? `${(m / 1000).toFixed(2)} km` : `${Math.round(m)} m`;
+
+    function render() {
+        queued = false;
+        if (!pos || !target) return;
+        const t = toTarget(pos, target);
+        const heading = compass !== null ? compass : moving;
+        const rel = heading === null ? t.bearing : t.bearing - heading;   // without any heading the arrow points relative to north
+        rot = rot === null ? rel : rot + (((rel - rot) % 360 + 540) % 360 - 180) * 0.3;   // shortest way round, smoothed
+        $('arrow').style.transform = `rotate(${rot}deg)`;
+        $('arrow').classList.toggle('ahead', Math.abs(((rel + 540) % 360) - 180) < 20);
+        $('dist').textContent = fmtDist(t.dist);
+        $('hint').textContent = t.dist <= Math.max(HERE_M, pos.acc) ? 'Közel vagy – innen szemmel keresd, a GPS már nem elég pontos.' : '';
+        const dir = compass !== null ? 'iránytű' : moving !== null ? 'haladási irány' : 'nincs (az északhoz képest mutat)';
+        $('info').innerHTML = `a telefon GPS-pontossága: <b>±${Math.round(pos.acc)} m</b><br>irány: <b>${dir}</b>` +
+            `<br><span class="mono">${target.lat.toFixed(6)}, ${target.lon.toFixed(6)}</span>`;
+    }
+    const schedule = () => { if (!queued) { queued = true; requestAnimationFrame(render); } };
+
+    function onPosition(p) {
+        const c = p.coords;
+        pos = { lat: c.latitude, lon: c.longitude, acc: c.accuracy };
+        if (c.speed > 0.8 && Number.isFinite(c.heading)) moving = c.heading;   // course over ground, a fallback for a missing compass
+        setStatus('');
+        schedule();
+    }
+    function onPositionError(e) {
+        setStatus(e.code === 1 ? 'A helymeghatározás tiltva – engedélyezd a böngésző beállításaiban.' : 'Nincs GPS-jel, várakozás…', e.code === 1);
+    }
+    function onOrientation(e) {
+        if (typeof e.webkitCompassHeading === 'number') compass = e.webkitCompassHeading;          // iOS
+        else if (e.absolute && typeof e.alpha === 'number') compass = (360 - e.alpha) % 360;       // Android (deviceorientationabsolute)
+        else return;
+        schedule();
+    }
+
+    let wakeLock = null;
+    function keepScreenOn() {
+        if (navigator.wakeLock) navigator.wakeLock.request('screen').then((l) => { wakeLock = l; }, () => {});
+    }
+
+    async function startSensors() {
+        started = true;
+        // iOS asks for the compass only inside a tap, and before anything else is awaited
+        if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
+            try { await DeviceOrientationEvent.requestPermission(); } catch (e) { /* denied: the course over ground is used */ }
+        }
+        window.addEventListener('deviceorientationabsolute', onOrientation);
+        window.addEventListener('deviceorientation', onOrientation);
+        navigator.geolocation.watchPosition(onPosition, onPositionError, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
+        keepScreenOn();
+        document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && !wakeLock) keepScreenOn(); });
+        $('dial').hidden = $('dist').hidden = $('info').hidden = false;
+        $('start').textContent = 'Pozíció frissítése';
+    }
+
+    $('form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const t = parseTarget($('coords').value);
+        if (!t) { setStatus('Nem értelmezhető – illeszd be így: 47.228300, 16.609700', true); return; }
+        target = t;
+        rot = null;
+        try { localStorage.setItem(STORE_KEY, `${t.lat}, ${t.lon}`); } catch (err) { /* storage blocked: it is just not remembered */ }
+        $('maps').href = `https://www.google.com/maps/dir/?api=1&destination=${t.lat},${t.lon}&travelmode=walking`;
+        $('actions').hidden = false;
+        $('coords').blur();
+        if (started) { setStatus(''); schedule(); }
+        else { setStatus('GPS-jelre várok…'); startSensors(); }
+    });
+
+    if (!window.isSecureContext || !navigator.geolocation) {
+        setStatus('A GPS és az iránytű csak HTTPS-en működik – ezt az oldalt https:// címről nyisd meg.', true);
+        $('start').disabled = true;
+    } else {
+        try { $('coords').value = localStorage.getItem(STORE_KEY) || ''; } catch (e) { /* nothing remembered */ }
+        setStatus('Tartsd a telefont vízszintesen, vagy kissé megdöntve.');
+    }
+})();
+</script>
+</body>
+</html>
